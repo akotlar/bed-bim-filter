@@ -11,6 +11,7 @@ import (
   "sync"
   "strconv"
   "regexp"
+  "bytes"
 )
 
 var concurrency int = 10
@@ -27,7 +28,7 @@ func setup(args []string) *Config {
   config := &Config{}
   flag.StringVar(&config.inPath, "inPath", "", "The input file path (optional: default is stdin)")
   flag.StringVar(&config.bedPath, "bedPath", "", "The bed file path containing chr , pos to filter on")
-  flag.BoolVar(&config.ucscChr, "ucscChr", true, "Normalize bed file to ucsc style chromosomes (chrN)")
+  flag.BoolVar(&config.ucscChr, "ucscChr", false, "Normalize bed file to ucsc style chromosomes (chrN)")
   flag.IntVar(&config.chrIdx, "chrIdx", 0, "The chr field index")
   flag.IntVar(&config.posIdx, "posIdx", 1, "The position column index")
 
@@ -90,7 +91,7 @@ func main() {
 
   reader := bufio.NewReader(inFh)
 
-  readSnp(config, reader, bedMap, func(row string) {fmt.Println(row)})
+  readFile(config, reader, bedMap, func(row string) {fmt.Println(row)})
 }
 
 func readBed(config *Config, reader *bufio.Reader) map[string]map[int]bool {
@@ -99,7 +100,6 @@ func readBed(config *Config, reader *bufio.Reader) map[string]map[int]bool {
   posIdx := config.posIdx 
   convertUCSC := config.ucscChr
 
-  var chr string
   for {
     row, err := reader.ReadString('\n')
 
@@ -119,26 +119,26 @@ func readBed(config *Config, reader *bufio.Reader) map[string]map[int]bool {
       log.Fatal("Couldn't convert pos to integer", record)
     }
 
-
-    if convertUCSC {
-      chr = "chr" + record[chrIdx]
-    } else {
-      chr = record[chrIdx]
+    if convertUCSC && (len(record[chrIdx]) < 4 || record[chrIdx][:3] != "chr") {
+      var buffer bytes.Buffer
+      buffer.WriteString("chr")
+      buffer.WriteString(record[chrIdx])
+      record[chrIdx] = buffer.String()
     }
 
-    _, ok := existsMap[chr];
+    _, ok := existsMap[record[chrIdx]];
 
     if !ok {
-      existsMap[chr] = map[int]bool{ pos: true}
+      existsMap[record[chrIdx]] = map[int]bool{ pos: true}
     } else {
-      existsMap[chr][pos] = true
+      existsMap[record[chrIdx]][pos] = true
     }
   }
 
   return existsMap
 }
 
-func readSnp(config *Config, reader *bufio.Reader, posMap map[string]map[int]bool,
+func readFile(config *Config, reader *bufio.Reader, posMap map[string]map[int]bool,
   resultFunc func(row string)) {
   // Read buffer
   workQueue := make(chan string, 100)
@@ -151,6 +151,29 @@ func readSnp(config *Config, reader *bufio.Reader, posMap map[string]map[int]boo
 
   if err != nil {
     log.Fatal(err)
+  }
+
+  if regexp.MustCompile("##fileformat=VCF").MatchString(headerLine) {
+    // Skip VCF headers
+    for {
+      row, err := reader.ReadString(endOfLineByte) // 0x0A separator = newline
+
+      if err == io.EOF {
+        break
+      } else if err != nil {
+        log.Fatal(err)
+      } else if row == "" {
+        // We may have not closed the pipe, but not have any more information to send
+        // Wait for EOF
+        continue
+      }
+
+      headerLine += row
+
+      if row[:6] == "#CHROM" {
+        break
+      }
+    }
   }
 
   fmt.Print(headerLine)
@@ -187,7 +210,7 @@ func readSnp(config *Config, reader *bufio.Reader, posMap map[string]map[int]boo
 
   // Now read them all off, concurrently.
   for i := 0; i < concurrency; i++ {
-    go processLine(config, posMap, workQueue, results, complete)
+    go processLine(config, posMap, config.ucscChr, workQueue, results, complete)
   }
 
   // Wait for everyone to finish.
@@ -200,7 +223,7 @@ func readSnp(config *Config, reader *bufio.Reader, posMap map[string]map[int]boo
   wg.Wait()
 }
 
-func processLine(config *Config, posMap map[string]map[int]bool, queue chan string, results chan string, complete chan bool) {
+func processLine(config *Config, posMap map[string]map[int]bool, convertUCSC bool, queue chan string, results chan string, complete chan bool) {
   for line := range queue {
     record := strings.Split(line, "\t")
 
@@ -208,6 +231,13 @@ func processLine(config *Config, posMap map[string]map[int]bool, queue chan stri
 
     if (err != nil) {
       log.Fatal("Couldn't convert position", record)
+    }
+
+    if convertUCSC && (len(record[0]) < 4 || record[0][:3] != "chr") {
+      var buffer bytes.Buffer
+      buffer.WriteString("chr")
+      buffer.WriteString(record[0])
+      record[0] = buffer.String()
     }
 
     if posMap[record[0]][pos] {
